@@ -1,154 +1,259 @@
-"""flops.py — FLOPs por token de spacemoe, por profundidad (escalera) y ancho MoSE.
+"""flops.py — FLOPs por token y presupuesto, por profundidad (escalera) y ancho MoSE.
 
-Cuenta FLOPs de FORWARD (2 por MAC), con las proyecciones reales de MLA y el
-MoE slimmable. Las cuentas de atencion dependen de la longitud de secuencia, asi
-que se reportan decode (S=1) y prefill.
+Dos configs:
+  CFG_SPACEMOE  — la de spacemoe/train.py: 16 capas, dim 512, 4 experts.
+                  Verificada: 16 capas = 171,932,048 params (lo que imprime train.py).
+  CFG_GRANDE    — 32 capas, dim 1024, 64 experts, top-4.
 
-Verificado contra el log de train.py: 16 capas = 171,932,048 params.
+Cuenta FLOPs de FORWARD (2 por MAC). Las cuentas de atencion dependen de la
+longitud de secuencia, asi que se reportan decode (S=1) y prefill.
 
-    python flops.py            # tabla
-    python flops.py 8 0.5      # una celda: 8 capas al 50%
+    python flops.py                 # las dos configs
+    python flops.py grande 2 0.25   # una celda: 2 capas al 25%
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from ladder import Escalera
 
-# ── Config (la de train.py; cambiala si cambias el modelo) ──
-D = 512                 # d_model
-L = 16                  # num_layers
-H = 12                  # num_heads
-G = 4                   # num_kv_groups
-HEAD_DIM = D // H       # 42 (division entera)
-D_C = 64                # latente KV
-D_C1 = 85               # latente Q
-D_ROT = 42              # parte rope
-E = 4                   # n_experts
-TOP_K = 2               # top_k
-N_SHARED = 1            # experts compartidos (densos, siempre)
-WIDTHS = (0.25, 0.50, 0.75, 1.00)
-FFN_EXP = 4.0
-ROUND_TO = 64
-VOCAB = 32000
-N_DENSE_START = 1       # capas 0..N_DENSE_START-1 densas
-PISO = 2
 
-# intermediate_dim: mismo calculo que block.compute_intermediate_dim
-_raw = int(FFN_EXP * D * 2.0 / 3.0)
-INTER = ((_raw + ROUND_TO - 1) // ROUND_TO) * ROUND_TO   # 1408
+@dataclass
+class Config:
+    nombre: str
+    d_model: int
+    num_layers: int
+    num_heads: int
+    num_kv_groups: int
+    d_c: int
+    d_c1: int
+    d_rotate: int
+    n_experts: int
+    top_k: int
+    n_shared: int
+    widths: tuple
+    ffn_expansion: float = 4.0
+    round_to: int = 64
+    vocab: int = 32000
+    n_dense_start: int = 1
+    piso: int = 2
+    seq_prefill: int = 800
 
+    @property
+    def head_dim(self) -> int:
+        return self.d_model // self.num_heads
 
-# ── Parametros por capa ──
-def params_mla() -> int:
-    w_down = D * (D_C1 + D_C + D_ROT)
-    w_up_q = D_C1 * H * (HEAD_DIM + D_ROT)
-    w_up_kv = D_C * 2 * G * HEAD_DIM
-    o_proj = H * HEAD_DIM * D
-    norms = (D_C1 + D_C) + 2 * HEAD_DIM
-    return w_down + w_up_q + w_up_kv + o_proj + norms
+    @property
+    def intermediate(self) -> int:
+        raw = int(self.ffn_expansion * self.d_model * 2.0 / 3.0)
+        return ((raw + self.round_to - 1) // self.round_to) * self.round_to
 
-
-def params_dense_ffn() -> int:
-    return 3 * D * INTER          # SwiGLU: (D,2I) + (I,D)
+    @property
+    def n_routes(self) -> int:
+        return self.n_experts * len(self.widths)
 
 
-def params_moe_ffn() -> int:
-    router = D * (E * len(WIDTHS))
-    experts = E * params_dense_ffn()
-    shared = N_SHARED * params_dense_ffn()
-    return router + experts + shared
+CFG_SPACEMOE = Config(
+    nombre="spacemoe 16L d512 E4",
+    d_model=512, num_layers=16, num_heads=12, num_kv_groups=4,
+    d_c=64, d_c1=85, d_rotate=42,
+    n_experts=4, top_k=2, n_shared=1, widths=(0.25, 0.50, 0.75, 1.00),
+)
+
+# 32 capas, dim 1024, 64 experts, top-4. Lo que NO dijo el pedido, y asumo:
+#   num_heads=16 (head_dim 64), G=4, d_c=128, d_c1=170, d_rot=64,
+#   expert_dim = intermediate (como el default del codigo), 1 capa dense,
+#   vocab 32000, expansion 4.0, piso de escalera 2.
+CFG_GRANDE = Config(
+    nombre="32L d1024 E64 top4",
+    d_model=1024, num_layers=32, num_heads=16, num_kv_groups=4,
+    d_c=128, d_c1=170, d_rotate=64,
+    n_experts=64, top_k=4, n_shared=1, widths=(0.25, 0.50, 0.75, 1.00),
+)
 
 
-def params_capa(idx: int) -> int:
-    base = params_mla() + 4 * D          # + norms del bloque (sandwich)
-    if idx < N_DENSE_START:
-        return base + params_dense_ffn()
-    return base + params_moe_ffn()
+# ── Parametros ──
+def params_mla(c: Config) -> int:
+    d, h, g, hd = c.d_model, c.num_heads, c.num_kv_groups, c.head_dim
+    return (d * (c.d_c1 + c.d_c + c.d_rotate)
+            + c.d_c1 * h * (hd + c.d_rotate)
+            + c.d_c * 2 * g * hd
+            + h * hd * d
+            + (c.d_c1 + c.d_c) + 2 * hd)
+
+
+def params_dense_ffn(c: Config) -> int:
+    return 3 * c.d_model * c.intermediate
+
+
+def params_moe_ffn(c: Config) -> int:
+    return (c.d_model * c.n_routes
+            + c.n_experts * params_dense_ffn(c)
+            + c.n_shared * params_dense_ffn(c))
+
+
+def params_capa(c: Config, idx: int) -> int:
+    base = params_mla(c) + 4 * c.d_model        # + norms del bloque
+    if idx < c.n_dense_start:
+        return base + params_dense_ffn(c)
+    return base + params_moe_ffn(c)
 
 
 # ── FLOPs por token (2 por MAC) ──
-def macs_mla(seq: int) -> float:
-    """Proyecciones (no dependen de S) + scores y AV (dependen de S)."""
-    proy = D * (D_C1 + D_C + D_ROT) \
-        + D_C1 * H * (HEAD_DIM + D_ROT) \
-        + D_C * 2 * G * HEAD_DIM \
-        + H * HEAD_DIM * D
-    # por token: QK^T y A·V sobre S posiciones, en las dos partes (estado + rope)
-    scores = 2 * H * seq * (HEAD_DIM + D_ROT)
+def macs_mla(c: Config, seq: int) -> float:
+    d, h, g, hd = c.d_model, c.num_heads, c.num_kv_groups, c.head_dim
+    proy = (d * (c.d_c1 + c.d_c + c.d_rotate)
+            + c.d_c1 * h * (hd + c.d_rotate)
+            + c.d_c * 2 * g * hd
+            + h * hd * d)
+    scores = 2 * h * seq * (hd + c.d_rotate)   # QK^T y A·V, dos partes
     return proy + scores
 
 
-def macs_dense_ffn() -> float:
-    return 3.0 * D * INTER
+def macs_dense_ffn(c: Config) -> float:
+    return 3.0 * c.d_model * c.intermediate
 
 
-def macs_moe_ffn(width: float) -> float:
-    """top_k expertos al ancho pedido + los compartidos a ancho completo."""
-    d = max(8, int(INTER * width))
-    por_experto = 2.0 * D * d          # (D,2d) + (d,D)
-    router = D * (E * len(WIDTHS))
-    return TOP_K * por_experto + N_SHARED * params_dense_ffn() * 1.0 + router
+def macs_moe_ffn(c: Config, width: float) -> float:
+    d = max(8, int(c.intermediate * width))
+    por_experto = 2.0 * c.d_model * d          # (D,2d) + (d,D)
+    router = c.d_model * c.n_routes
+    return c.top_k * por_experto + c.n_shared * params_dense_ffn(c) + router
 
 
-def macs_capa(idx: int, seq: int, width: float) -> float:
-    m = macs_mla(seq)
-    if idx < N_DENSE_START:
-        m += macs_dense_ffn()           # la densa siempre completa
+def macs_capa(c: Config, idx: int, seq: int, width: float) -> float:
+    m = macs_mla(c, seq)
+    if idx < c.n_dense_start:
+        m += macs_dense_ffn(c)                 # la densa siempre completa
     else:
-        m += macs_moe_ffn(width)
+        m += macs_moe_ffn(c, width)
     return m
 
 
-def macs_head() -> float:
-    return D * VOCAB
+def macs_head(c: Config) -> float:
+    return c.d_model * c.vocab
 
 
-def medir(profundidad: int, width: float = 1.0, seq: int = 1,
-          escalera: Escalera | None = None) -> dict:
-    esc = escalera or Escalera(n_capas=L, minima=PISO)
+def medir(c: Config, profundidad: int, width: float = 1.0, seq: int = 1) -> dict:
+    esc = Escalera(n_capas=c.num_layers, minima=c.piso)
     capas = esc.indices(profundidad)
-    p = sum(params_capa(i) for i in capas)
-    macs = sum(macs_capa(i, seq, width) for i in capas) + macs_head()
-    return {
-        "capas": capas,
-        "params": p,
-        "params_pct": 100.0 * p / sum(params_capa(i) for i in range(L)),
-        "macs": macs,
-        "flops": 2 * macs,
-    }
+    p = sum(params_capa(c, i) for i in capas)
+    total = sum(params_capa(c, i) for i in range(c.num_layers))
+    macs = sum(macs_capa(c, i, seq, width) for i in capas) + macs_head(c)
+    return {"capas": capas, "params": p, "params_pct": 100.0 * p / total,
+            "macs": macs, "flops": 2 * macs}
 
 
 def _fmt(n: float) -> str:
     return f"{n/1e6:.2f}M" if n < 1e9 else f"{n/1e9:.2f}G"
 
 
+# Los indices por defecto: mismas filas que usaste para la de 16 capas.
+FILAS_BASE = [(2, 0.25), (2, 1.00), (4, 0.50), (6, 0.25),
+              (8, 0.50), (8, 1.00), (10, 0.25), (16, 1.00)]
+
+
+def _caja(cabeceras: list[str], filas: list[list[str]]) -> str:
+    """Caja con bordes, como la tabla que me pasaste."""
+    anchos = [max(len(cabeceras[i]),
+                  max((len(f[i]) for f in filas), default=0)) for i in range(len(cabeceras))]
+
+    def sep(izq, mid, der):
+        return izq + mid.join("─" * (w + 2) for w in anchos) + der
+
+    out = [sep("┌", "┬", "┐"),
+           "│ " + " │ ".join(h.ljust(anchos[i]) for i, h in enumerate(cabeceras)) + " │",
+           sep("├", "┼", "┤")]
+    for f in filas:
+        out.append("│ " + " │ ".join(f[i].ljust(anchos[i]) for i in range(len(f))) + " │")
+    out.append(sep("└", "┴", "┘"))
+    return "\n".join(out)
+
+
+def tabla(c: Config, filas=None) -> None:
+    esc = Escalera(n_capas=c.num_layers, minima=c.piso)
+    total = sum(params_capa(c, i) for i in range(c.num_layers))
+    filas = filas or FILAS_BASE
+    filas = [(d, w) for d, w in filas if d <= c.num_layers]
+    if filas and filas[-1][0] != c.num_layers:
+        filas.append((c.num_layers, 1.00))
+
+    print(f"\n=== {c.nombre} ===")
+    print(f"dim={c.d_model} L={c.num_layers} H={c.num_heads} G={c.num_kv_groups} "
+          f"head_dim={c.head_dim}")
+    print(f"d_c={c.d_c} d_c1={c.d_c1} d_rot={c.d_rotate} "
+          f"intermediate={c.intermediate} expert_dim={c.intermediate}")
+    print(f"experts={c.n_experts} top_k={c.top_k} shared={c.n_shared} "
+          f"widths={c.widths} rutas={c.n_routes}")
+    print(f"vocab={c.vocab} densas={c.n_dense_start} piso_escalera={c.piso}")
+    print(f"params total = {total:,}")
+    print(f"cabeza (lm_head) = {2*macs_head(c)/1e6:.1f} MFLOPs/token (fijo)")
+
+    filas_txt = []
+    for d, w in filas:
+        r1 = medir(c, d, w, seq=1)
+        r8 = medir(c, d, w, seq=c.seq_prefill)
+        filas_txt.append([
+            f"{d}L @{w:.0%}",
+            _params(c, r1["params"]),
+            f"{r1['params_pct']:.0f}%",
+            f"{r1['flops']/1e6:.1f} MFLOPs",
+            f"{_corto(r8['flops'])}",
+        ])
+    print()
+    print(_caja(["cfg", "params", "%", f"decode (S=1)",
+                 f"prefill S={c.seq_prefill}"], filas_txt))
+
+
+def _params(c: Config, n: int) -> str:
+    if n >= 1e9:
+        return f"{n/1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n/1e6:.1f}M"
+    return str(n)
+
+
+def _corto(n: float) -> str:
+    return f"{n/1e6:.1f}M" if n < 1e9 else f"{n/1e9:.2f}G"
+
+
+def presupuesto(c: Config) -> None:
+    """El presupuesto: que cuesta el piso de la escalera y cuanto se paga."""
+    esc = Escalera(n_capas=c.num_layers, minima=c.piso)
+    completo = medir(c, c.num_layers, 1.0, seq=1)
+    print(f"\n--- presupuesto ({c.nombre}) ---")
+    for d in (c.piso, 4, 8, 16, c.num_layers):
+        if d > c.num_layers:
+            continue
+        peor = medir(c, d, 1.0, seq=1)
+        mejor = medir(c, d, 0.25, seq=1)
+        print(f"  {d:2d}L: {mejor['flops']/1e6:8.2f} MFLOPs (25%) .. "
+              f"{peor['flops']/1e6:8.2f} MFLOPs (100%)   "
+              f"params {peor['params']:>15,} ({peor['params_pct']:3.0f}%)")
+    piso = medir(c, c.piso, 1.0, seq=1)
+    print(f"  piso {c.piso}L@100% = {piso['flops']/1e6:.2f} MFLOPs/token = "
+          f"{100*piso['flops']/completo['flops']:.1f}% del modelo completo")
+    print(f"  16L@25%            = {medir(c,16,0.25)['flops']/1e6:.2f} MFLOPs/token = "
+          f"{100*medir(c,16,0.25)['flops']/completo['flops']:.1f}% del modelo completo")
+    print(f"  orden de la escalera = {esc.orden}")
+
+
 if __name__ == "__main__":
     import sys
 
-    esc = Escalera(n_capas=L, minima=PISO)
-    total_params = sum(params_capa(i) for i in range(L))
-    print(f"d_model={D} L={L} H={H} G={G} head_dim={HEAD_DIM} "
-          f"d_c={D_C} d_c1={D_C1} d_rot={D_ROT} intermediate={INTER}")
-    print(f"experts={E} top_k={TOP_K} shared={N_SHARED} widths={WIDTHS} "
-          f"vocab={VOCAB} densas={N_DENSE_START}")
-    print(f"params 16 capas = {total_params:,}  (train.py dice 171,932,048)")
-    print(f"orden escalera  = {esc.orden}\n")
-
-    if len(sys.argv) > 2:
-        d, w = int(sys.argv[1]), float(sys.argv[2])
-        r = medir(d, w, seq=1, escalera=esc)
-        print(f"{d}L @ {w:.0%}: params {r['params']:,} "
-              f"({r['params_pct']:.0f}%)  {r['flops']/1e6:.2f} MFLOPs/token (decode)")
+    if len(sys.argv) > 1 and sys.argv[1] == "grande":
+        c = CFG_GRANDE
+        if len(sys.argv) > 3:
+            d, w = int(sys.argv[2]), float(sys.argv[3])
+            r = medir(c, d, w, seq=1)
+            print(f"{c.nombre}: {d}L @ {w:.0%} -> {r['params']:,} params "
+                  f"({r['params_pct']:.0f}%), {r['flops']/1e6:.2f} MFLOPs/token")
+        else:
+            tabla(c)
+            presupuesto(c)
     else:
-        print(f"{'cfg':>12} {'params':>14} {'%':>5} "
-              f"{'decode':>12} {'prefill S=800':>14}")
-        print("-" * 64)
-        for d in (2, 4, 6, 8, 10, 12, 16):
-            for w in (0.25, 0.50, 1.00):
-                r1 = medir(d, w, seq=1, escalera=esc)
-                r8 = medir(d, w, seq=800, escalera=esc)
-                print(f"{f'{d}L@{w:.0%}':>12} {r1['params']:>14,} "
-                      f"{r1['params_pct']:>4.0f}% {_fmt(r1['flops']):>12} "
-                      f"{_fmt(r8['flops']):>14}")
-        print("\n(desde la primera capa densa: toda subred incluye la capa 0,")
-        print(" asi que el minimo de una subred es 1 densa + (d-1) MoE)")
+        tabla(CFG_SPACEMOE)
+        print("\nparams de 16 capas deben dar 171,932,048")
+        if "--grande" in sys.argv:
+            tabla(CFG_GRANDE)
