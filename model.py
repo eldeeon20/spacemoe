@@ -168,21 +168,22 @@ class TransformerLM(nn.Module):
         else:
             self.x0_lambdas = None
 
-    def forward(self, input_ids: torch.Tensor, width=None) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, input_ids: torch.Tensor, width=None, active=None) -> tuple[torch.Tensor, torch.Tensor]:
         """Standard forward (for training, no cache).
 
         Args:
             input_ids: (batch, seq_len) - token indices
             width: ancho global MoSE (None = router libre, inferencia)
+            active: lista de bool, uno por capa (escalera). False = se saltea.
         Returns:
             (logits, aux_loss): (batch, seq_len, vocab_size), scalar tensor
             aux_loss is the z-loss from MoE routers (0 if no MoE).
         """
         x = self.embedding(input_ids)
         if self.use_moe:
-            x, aux_loss = self.transformer(x, 0, width)
+            x, aux_loss = self.transformer(x, 0, width, active=active)
         else:
-            x = self.transformer(x, 0)
+            x = self.transformer(x, 0, active=active)
             aux_loss = 0.0
         return self.head(x), aux_loss
 
@@ -191,8 +192,13 @@ class TransformerLM(nn.Module):
         input_ids: torch.Tensor,
         rotary_pct: float = 0.5,
         width=None,
+        active=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward with partial RoPE + x0 injection."""
+        """Forward with partial RoPE + x0 injection.
+
+        active: lista de bool, uno por capa. La capa saltada no toca el
+        residual, ni su router, ni su cache.
+        """
         x = self.embedding(input_ids)
         batch, seq_len, _ = x.shape
         x0 = x.clone()
@@ -200,6 +206,8 @@ class TransformerLM(nn.Module):
         aux_loss = torch.tensor(0.0, device=h.device)
 
         for i, layer in enumerate(self.transformer.layers):
+            if active is not None and not active[i]:
+                continue
             residual = h
             h_norm = layer.attn_norm(h)
 
@@ -268,10 +276,16 @@ class TransformerLM(nn.Module):
         offset: int,
         caches: list[KVCache | None],
         width=None,
+        active=None,
     ) -> tuple[torch.Tensor, list[KVCache]]:
-        """Forward with KV cache for autoregressive generation."""
+        """Forward with KV cache for autoregressive generation.
+
+        active: lista de bool por capa. La cache es por capa absoluta: no cambies
+        la profundidad a mitad de la generacion.
+        """
         x = self.embedding(input_ids)
-        x, new_caches = self.transformer.forward_with_cache(x, offset, caches, width)
+        x, new_caches = self.transformer.forward_with_cache(
+            x, offset, caches, width, active=active)
         return self.head(x), new_caches
 
     def forward_with_cache_partial(
@@ -281,13 +295,18 @@ class TransformerLM(nn.Module):
         caches: list[KVCache | None],
         rotary_pct: float = 0.5,
         width=None,
+        active=None,
     ) -> tuple[torch.Tensor, list[KVCache]]:
+        """Forward with KV cache + partial RoPE. active: bool por capa."""
         """Forward with KV cache + partial RoPE."""
         x = self.embedding(input_ids)
         h = x
         new_caches = []
 
         for i, (layer, cache) in enumerate(zip(self.transformer.layers, caches)):
+            if active is not None and not active[i]:
+                new_caches.append(cache)
+                continue
             residual = h
             h_norm = layer.attn_norm(h)
 
@@ -421,6 +440,7 @@ class TransformerLM(nn.Module):
         use_partial_rope: bool = False,
         rotary_pct: float = 0.5,
         width=None,
+        active=None,
     ) -> torch.Tensor:
         """Autoregressive text generation with KV cache.
 
@@ -428,6 +448,9 @@ class TransformerLM(nn.Module):
             input_ids: (batch, prompt_len)
             max_new_tokens: number of tokens to generate
             width: ancho MoSE forzado (None = router libre, inferencia)
+            active: bool por capa (escalera). Es FIJO durante toda la
+                generacion: la cache es de esa profundidad. Para cambiar de
+                profundidad, genera de nuevo con la cache limpia.
         Returns:
             (batch, prompt_len + max_new_tokens)
         """
@@ -448,11 +471,11 @@ class TransformerLM(nn.Module):
         prompt_len = generated.shape[1]
         if use_partial_rope:
             logits, caches = self.forward_with_cache_partial(
-                generated, 0, caches, rotary_pct, width
+                generated, 0, caches, rotary_pct, width, active=active
             )
         else:
             logits, caches = self.forward_with_cache(
-                generated, 0, caches, width
+                generated, 0, caches, width, active=active
             )
         offset = prompt_len
 
@@ -492,11 +515,11 @@ class TransformerLM(nn.Module):
             # Forwardea solo el token nuevo en su posicion absoluta.
             if use_partial_rope:
                 logits, caches = self.forward_with_cache_partial(
-                    generated[:, -1:], offset, caches, rotary_pct, width
+                    generated[:, -1:], offset, caches, rotary_pct, width, active=active
                 )
             else:
                 logits, caches = self.forward_with_cache(
-                    generated[:, -1:], offset, caches, width
+                    generated[:, -1:], offset, caches, width, active=active
                 )
             offset += 1
 

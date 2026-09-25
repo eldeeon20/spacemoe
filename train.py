@@ -5,7 +5,8 @@ sys.path.insert(0, _DIR)
 sys.path.insert(0, os.path.join(_DIR, ".."))
 from model import TransformerLM
 import importlib
-train_data = importlib.import_module("train-data")
+
+from ladder import Escalera, plan_step, MIN_PROFUNDIDAD
 from wikipedia import download_wikipedia_50mb
 from huggingface import HFManager, PeriodicPusher
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
@@ -23,12 +24,12 @@ class BPEWrapper:
 
 
 @torch.no_grad()
-def generate_sample(model, tokenizer, device, prompt="hola", max_new=30, width=None):
+def generate_sample(model, tokenizer, device, prompt="hola", max_new=30, width=None, active=None):
     model.eval()
     x = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
     out = model.generate(x, max_new_tokens=max_new, temperature=0.7, top_k=40, top_p=0.9,
                          repetition_penalty=1.2, use_partial_rope=use_partial_rope, rotary_pct=rotary_pct,
-                         width=width)
+                         width=width, active=active)
     model.train()
     return tokenizer.decode(out[0].tolist())
 
@@ -99,6 +100,16 @@ bias_decay = 0.1
 # ─── MoSE Eq.(6): L = 1/2 [L(w_max) + L(w)], w ~ U(w_min, w_max) ───
 mose_w_min = 0.25
 mose_w_max = 1.0
+
+# ─── Escalera de capas (ladder.py) ───────────────────────────────────────────
+# Cada step sortea UNA profundidad y corre solo esas capas. Los dos forwards de
+# MoSE (w_max y w aleatorio) usan la MISMA mascara: es un step, una profundidad,
+# y asi la cache no mezcla profundidades. El ruteo de expertos sigue siendo por
+# token, normal.
+ladder_on = True            # False = siempre 16 capas (comportamiento viejo)
+ladder_p_subred = 0.2       # 0.8 de los steps van a modelo completo
+ladder_lambda = 1.0         # peso del KL contra el profesor (stop-gradient)
+ladder_min_profundidad = 2  # piso; el paper arranca en 2
 
 plot_interval = 256
 
@@ -196,6 +207,17 @@ def main():
     opt = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), fused=use_fused)
     print(f"AdamW fused={use_fused} | decay={len(other_decay_params)} param tensors, emb_lr=lr/4, nodecay={len(nodecay_params)}")
 
+    # ── Escalera de capas ───────────────────────────────────────────────────
+    escalera = Escalera(n_capas=num_layers, minima=ladder_min_profundidad)
+    escalera_en = ladder_on and num_layers >= escalera.minima
+    rng_ladder = random.Random(step if not test_mode else 0)
+    if escalera_en:
+        print(f"Ladder: {num_layers} capas, orden {escalera.orden}")
+        print(f"  peldaños {escalera.profundidades()[0]}..{num_layers}, "
+              f"p_subred={ladder_p_subred}, lambda={ladder_lambda}")
+    else:
+        print("Ladder: apagado (siempre modelo completo)")
+
     # ── Checkpoint ─────────────────────────────────────────────────────────
     step = 0
     epoch = 0
@@ -212,6 +234,9 @@ def main():
             step = ckpt.get("step", 0)
             epoch = ckpt.get("epoch", 0)
             ckpt_block = ckpt.get("block", 0)
+            if ckpt.get("ladder") and escalera_en:
+                escalera = Escalera.desde_dict(ckpt["ladder"])
+                print(f"Ladder del checkpoint: {escalera.orden}")
             del ckpt
             torch.cuda.empty_cache()
             print(f"Loaded checkpoint: step {step} epoch {epoch} block {ckpt_block}")
@@ -223,10 +248,22 @@ def main():
             step = ckpt.get("step", 0)
             epoch = ckpt.get("epoch", 0)
             ckpt_block = ckpt.get("block", 0)
+            if ckpt.get("ladder") and escalera_en:
+                escalera = Escalera.desde_dict(ckpt["ladder"])
+                print(f"Ladder del checkpoint: {escalera.orden}")
             del ckpt
             torch.cuda.empty_cache()
             print(f"Loaded HF checkpoint: step {step} epoch {epoch} block {ckpt_block}")
             loaded = True
+
+        if loaded and escalera_en:
+            print("\n── Generation test por peldaño ──")
+            for p in ["hola", "en un lugar de la mancha"]:
+                for d in escalera.profundidades():
+                    muestra = generate_sample(model, tokenizer, device, prompt=p,
+                                              max_new=40, active=escalera.mascara(d))
+                    print(f"  [{d:2d}L][{p}] -> {muestra}")
+            print("── End test ──\n")
 
         if loaded:
             print("\n── Generation test (MoSE anchos) ──")
@@ -322,6 +359,16 @@ def main():
                 for pg in opt.param_groups:
                     pg["lr"] = lr_curr * pg.get("lr_scale", 1.0)
                 opt.zero_grad()
+                # Un step = una sola profundidad, fija para todo el batch.
+                if escalera_en:
+                    plan = plan_step(escalera, rng_ladder, p_subred=1.0 - ladder_p_subred)
+                    active = plan["mascara"]
+                    prof = plan["profundidad"]
+                    esc_step = plan["escala"]
+                    es_subred = plan["es_profesor"]
+                else:
+                    active, prof, esc_step, es_subred = None, num_layers, 1.0, False
+                    w_depth_last = num_layers
 
             if use_moe:
                 # MoSE Eq.(6): dos forwards por minibatch (w_max + w aleatorio).
@@ -329,21 +376,47 @@ def main():
                 # mitad de pico de memoria que retener los dos grafos.
                 w_random = random.uniform(mose_w_min, mose_w_max)
                 w_last = w_random
+                # Profesor: el modelo COMPLETO sin gradiente (es el sg[p_L] del
+                # paper). Solo en los steps de subred.
+                if es_subred:
+                    with torch.no_grad():
+                        if use_partial_rope:
+                            logits_t, _ = model.forward_train_partial_rope(
+                                x, rotary_pct=rotary_pct, width=mose_w_max)
+                        else:
+                            logits_t, _ = model(x, width=mose_w_max)
+                        p_teacher = F.log_softmax(
+                            logits_t.reshape(-1, tokenizer.vocab_size), dim=-1).detach()
+                    del logits_t
                 if use_partial_rope:
-                    logits_f, aux_f = model.forward_train_partial_rope(x, rotary_pct=rotary_pct, width=mose_w_max)
+                    logits_f, aux_f = model.forward_train_partial_rope(
+                        x, rotary_pct=rotary_pct, width=mose_w_max, active=active)
                 else:
-                    logits_f, aux_f = model(x, width=mose_w_max)
+                    logits_f, aux_f = model(x, width=mose_w_max, active=active)
                 loss_f = F.cross_entropy(logits_f.reshape(-1, tokenizer.vocab_size), y.reshape(-1))
-                (0.5 * (loss_f + aux_f) / grad_accum).backward()
+                if es_subred:
+                    p_alumno = F.log_softmax(
+                        logits_f.reshape(-1, tokenizer.vocab_size), dim=-1)
+                    kl = F.kl_div(p_alumno, p_teacher, log_target=True,
+                                  reduction="batchmean")
+                    loss_f = loss_f + ladder_lambda * kl
+                (esc_step * 0.5 * (loss_f + aux_f) / grad_accum).backward()
                 loss_f_log = float(loss_f.detach())
                 aux_f_log = float(aux_f.detach()) if isinstance(aux_f, torch.Tensor) else float(aux_f)
                 del logits_f, loss_f, aux_f
                 if use_partial_rope:
-                    logits_r, aux_r = model.forward_train_partial_rope(x, rotary_pct=rotary_pct, width=w_random)
+                    logits_r, aux_r = model.forward_train_partial_rope(
+                        x, rotary_pct=rotary_pct, width=w_random, active=active)
                 else:
-                    logits_r, aux_r = model(x, width=w_random)
+                    logits_r, aux_r = model(x, width=w_random, active=active)
                 loss_r = F.cross_entropy(logits_r.reshape(-1, tokenizer.vocab_size), y.reshape(-1))
-                (0.5 * (loss_r + aux_r) / grad_accum).backward()
+                if es_subred:
+                    p_alumno = F.log_softmax(
+                        logits_r.reshape(-1, tokenizer.vocab_size), dim=-1)
+                    kl = F.kl_div(p_alumno, p_teacher, log_target=True,
+                                  reduction="batchmean")
+                    loss_r = loss_r + ladder_lambda * kl
+                (esc_step * 0.5 * (loss_r + aux_r) / grad_accum).backward()
                 loss_r_log = float(loss_r.detach())
                 aux_r_log = float(aux_r.detach()) if isinstance(aux_r, torch.Tensor) else float(aux_r)
                 del logits_r, loss_r, aux_r
@@ -351,15 +424,39 @@ def main():
                 loss = torch.tensor(0.5 * (loss_f_log + loss_r_log))
                 aux_loss = torch.tensor(0.5 * (aux_f_log + aux_r_log))
             elif use_partial_rope:
-                logits, aux_loss = model.forward_train_partial_rope(x, rotary_pct=rotary_pct)
+                if es_subred:
+                    with torch.no_grad():
+                        logits_t, _ = model.forward_train_partial_rope(
+                            x, rotary_pct=rotary_pct)
+                        p_teacher = F.log_softmax(
+                            logits_t.reshape(-1, tokenizer.vocab_size), dim=-1).detach()
+                    del logits_t
+                logits, aux_loss = model.forward_train_partial_rope(
+                    x, rotary_pct=rotary_pct, active=active)
                 loss = F.cross_entropy(logits.reshape(-1, tokenizer.vocab_size), y.reshape(-1))
+                if es_subred:
+                    p_alumno = F.log_softmax(
+                        logits.reshape(-1, tokenizer.vocab_size), dim=-1)
+                    loss = loss + ladder_lambda * F.kl_div(
+                        p_alumno, p_teacher, log_target=True, reduction="batchmean")
                 loss = loss + aux_loss  # add MoE z-loss
-                (loss / grad_accum).backward()
+                (esc_step * loss / grad_accum).backward()
             else:
-                logits, aux_loss = model(x)
+                if es_subred:
+                    with torch.no_grad():
+                        logits_t, _ = model(x)
+                        p_teacher = F.log_softmax(
+                            logits_t.reshape(-1, tokenizer.vocab_size), dim=-1).detach()
+                    del logits_t
+                logits, aux_loss = model(x, active=active)
                 loss = F.cross_entropy(logits.reshape(-1, tokenizer.vocab_size), y.reshape(-1))
+                if es_subred:
+                    p_alumno = F.log_softmax(
+                        logits.reshape(-1, tokenizer.vocab_size), dim=-1)
+                    loss = loss + ladder_lambda * F.kl_div(
+                        p_alumno, p_teacher, log_target=True, reduction="batchmean")
                 loss = loss + aux_loss  # add MoE z-loss
-                (loss / grad_accum).backward()
+                (esc_step * loss / grad_accum).backward()
             micro += 1
 
             if micro >= grad_accum:
@@ -444,7 +541,8 @@ def main():
                             except Exception:
                                 pass
                     bal = " | ".join(balance_strs[:3])  # first 3 MoE layers only
-                    print(f"e{epoch} s{step} loss {loss.item():.4f} lr {lr_curr:.6f} {tps:.0f}t/s z={total_z_loss:.6f} lb={total_lb_loss:.6f} w={w_last:.2f}")
+                    prof_txt = f" prof={prof}L/{num_layers}" if escalera_en else ""
+                    print(f"e{epoch} s{step} loss {loss.item():.4f} lr {lr_curr:.6f} {tps:.0f}t/s z={total_z_loss:.6f} lb={total_lb_loss:.6f} w={w_last:.2f}{prof_txt}")
                     if use_moe:
                         print(f"  MoSE fwd: full_loss={loss_f_log:.4f} random_loss={loss_r_log:.4f} (w={w_last:.2f}) full_aux={aux_f_log:.6g} random_aux={aux_r_log:.6g}")
                     if bal:
@@ -465,7 +563,7 @@ def main():
                 if not test_mode and pusher and (time.time() - pusher.last_push) >= pusher.interval:
                     state = model.state_dict()
                     state.pop("head.emb_weight", None)
-                    ckpt = {"step": step, "epoch": epoch, "block": sd.block_idx if not test_mode else 0, "model": state}
+                    ckpt = {"step": step, "epoch": epoch, "block": sd.block_idx if not test_mode else 0, "model": state, "ladder": escalera.to_dict()}
                     torch.save(ckpt, ckpt_path)
                     pusher.maybe_push(ckpt_path, None, tok_path, step)
                     pm.plot(step)
@@ -494,7 +592,7 @@ def main():
             # piense que estamos al final y cae el LR al minimo (0.2*lr).
 
     if not test_mode and hf:
-        ckpt = {"step": step, "epoch": epoch, "block": sd.block_idx, "model": model.state_dict()}
+        ckpt = {"step": step, "epoch": epoch, "block": sd.block_idx, "model": model.state_dict(), "ladder": escalera.to_dict()}
         torch.save(ckpt, ckpt_path)
         hf.upload_checkpoint(ckpt_path, tok_path, step)
 

@@ -258,16 +258,28 @@ class MoETransformer(nn.Module):
         self.layers = nn.ModuleList(layers)
         self.final_norm = RMSNorm(d_model, eps=norm_eps)
 
-    def forward(self, x, offset=0, width=None):
+    def forward(self, x, offset=0, width=None, active=None):
+        """active: lista de bool, uno por capa. False = la capa se saltea
+        entera (no corre attn, ni router, ni experts) y el residual pasa de
+        largo. Ver ladder.py."""
         aux_losses = []
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            if active is not None and not active[i]:
+                continue
             x, aux = layer(x, offset, width)
             aux_losses.append(aux)
         return self.final_norm(x), sum(aux_losses)
 
-    def forward_with_cache(self, x, offset, caches, width=None):
+    def forward_with_cache(self, x, offset, caches, width=None, active=None):
+        """active: igual que en forward. La cache se indexa por capa ABSOLUTA,
+        asi que saltar una capa no remapea nada: simplemente ese slot queda
+        quieto. No cambies active a mitad de una generacion (la cache seria de
+        otra profundidad)."""
         new_caches = []
-        for layer, cache in zip(self.layers, caches):
+        for i, (layer, cache) in enumerate(zip(self.layers, caches)):
+            if active is not None and not active[i]:
+                new_caches.append(cache)
+                continue
             x, new_cache = layer.forward_with_cache(x, offset, cache, width)
             new_caches.append(new_cache)
         return self.final_norm(x), new_caches

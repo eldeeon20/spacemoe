@@ -288,9 +288,15 @@ class Transformer(nn.Module):
         self.use_sparse_attn = use_sparse_attn
         self.use_mla = use_mla
 
-    def forward(self, x: torch.Tensor, offset: int = 0) -> torch.Tensor:
-        """Forward through all layers + final norm."""
-        for layer in self.layers:
+    def forward(self, x: torch.Tensor, offset: int = 0, active=None) -> torch.Tensor:
+        """Forward through all layers + final norm.
+
+        active: lista de bool, uno por capa. False = la capa se saltea entera y
+        el residual pasa de largo (escalera de capas, ver ladder.py).
+        """
+        for i, layer in enumerate(self.layers):
+            if active is not None and not active[i]:
+                continue
             x = layer(x, offset)
         return self.final_norm(x)
 
@@ -299,10 +305,18 @@ class Transformer(nn.Module):
         x: torch.Tensor,
         offset: int,
         caches: list[KVCache | None],
+        active=None,
     ) -> tuple[torch.Tensor, list[KVCache]]:
-        """Forward through all layers with per-layer KV caches."""
+        """Forward through all layers with per-layer KV caches.
+
+        active: la cache es por capa absoluta, asi que saltar una capa no
+        remapea nada. No cambiar active durante la generacion.
+        """
         new_caches = []
-        for layer, cache in zip(self.layers, caches):
+        for i, (layer, cache) in enumerate(zip(self.layers, caches)):
+            if active is not None and not active[i]:
+                new_caches.append(cache)
+                continue
             x, new_cache = layer.forward_with_cache(x, offset, cache)
             new_caches.append(new_cache)
         return self.final_norm(x), new_caches
