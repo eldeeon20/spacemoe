@@ -1,4 +1,4 @@
-import sys, os, time, math, random, inspect, torch
+import sys, os, time, math, random, inspect, collections, torch
 import torch.nn.functional as F
 _DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _DIR)
@@ -211,6 +211,7 @@ def main():
     escalera = Escalera(n_capas=num_layers, minima=ladder_min_profundidad)
     escalera_en = ladder_on and num_layers >= escalera.minima
     rng_ladder = random.Random(0)  # seed fijo: la secuencia de profundidades es reproducible
+    historial_ladder = collections.deque(maxlen=10)  # ultimos 10 sorteos, para el log
     if escalera_en:
         print(f"Ladder: {num_layers} capas, orden {escalera.orden}")
         print(f"  peldaños {escalera.profundidades()[0]}..{num_layers}, "
@@ -366,6 +367,7 @@ def main():
                     prof = plan["profundidad"]
                     esc_step = plan["escala"]
                     es_subred = plan["es_profesor"]
+                    historial_ladder.append(prof)
                 else:
                     active, prof, esc_step, es_subred = None, num_layers, 1.0, False
                     w_depth_last = num_layers
@@ -542,6 +544,10 @@ def main():
                                 pass
                     bal = " | ".join(balance_strs[:3])  # first 3 MoE layers only
                     prof_txt = f" prof={prof}L/{num_layers}" if escalera_en else ""
+                    if escalera_en and len(historial_ladder) > 1:
+                        prof_txt += (" | ultimos "
+                                     + ",".join(f"{d}" for d in historial_ladder)
+                                     + " (" + str(len(historial_ladder)) + " sorteos)")
                     print(f"e{epoch} s{step} loss {loss.item():.4f} lr {lr_curr:.6f} {tps:.0f}t/s z={total_z_loss:.6f} lb={total_lb_loss:.6f} w={w_last:.2f}{prof_txt}")
                     if use_moe:
                         print(f"  MoSE fwd: full_loss={loss_f_log:.4f} random_loss={loss_r_log:.4f} (w={w_last:.2f}) full_aux={aux_f_log:.6g} random_aux={aux_r_log:.6g}")
