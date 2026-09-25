@@ -5,7 +5,7 @@ sys.path.insert(0, _DIR)
 sys.path.insert(0, os.path.join(_DIR, ".."))
 from model import TransformerLM
 import importlib
-
+train_data = importlib.import_module("train-data")
 from ladder import Escalera, plan_step, MIN_PROFUNDIDAD
 from wikipedia import download_wikipedia_50mb
 from huggingface import HFManager, PeriodicPusher
