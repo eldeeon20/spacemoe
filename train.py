@@ -112,7 +112,7 @@ def main():
 
     # ── HF ──────────────────────────────────────────────────────────────────
     repo_id = "ScortexIA/laurelia"
-    revision = "moe-plus"
+    revision = "spacemoe"
     hf = pusher = None
     if not test_mode:
         hf = HFManager(repo_id=repo_id, revision=revision)
