@@ -1,0 +1,16 @@
+# environment
+.venv/
+__pycache__/
+*.pyc
+
+# data, checkpoints and generated artifacts
+data/
+*.pt
+*.ckpt
+samples.txt
+
+# personal scratch notes (kept local)
+notes.md
+
+# run outputs (persisted on disk, not committed; curate showcase plots to root)
+results/
