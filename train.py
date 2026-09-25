@@ -210,7 +210,7 @@ def main():
     # ── Escalera de capas ───────────────────────────────────────────────────
     escalera = Escalera(n_capas=num_layers, minima=ladder_min_profundidad)
     escalera_en = ladder_on and num_layers >= escalera.minima
-    rng_ladder = random.Random(step if not test_mode else 0)
+    rng_ladder = random.Random(0)  # seed fijo: la secuencia de profundidades es reproducible
     if escalera_en:
         print(f"Ladder: {num_layers} capas, orden {escalera.orden}")
         print(f"  peldaños {escalera.profundidades()[0]}..{num_layers}, "
