@@ -41,9 +41,9 @@ asociados a la misma posición C2.
 
 Implementación: UNA sola FF por celda (up dim->h20, silu, down),
 h20 = base // 5 (20% de la base). Sin bias (como el sketch). El router
-es un Linear pelado dim->8 con softmax + top-2 renormalizado; el
-gradiente le llega por la CE a través de los pesos w1/w2 (no hay
-auxiliares: sin ruido, sin bias-feedback, sin z-loss).
+es un Linear dim->8 con softmax + top-2 renormalizado; entrena con
+ruido + bias-feedback + z-loss + balance (ver abajo) además del
+gradiente de la CE vía w1/w2.
 
 Interfaz drop-in para capas densas: ``forward(x) -> Tensor`` (la capa
 densa hace ``h = self.ffn(h)`` y espera tensor).
@@ -71,6 +71,14 @@ class GraniteFF(nn.Module):
         self.z_loss_gamma = z_loss_gamma
         self.load_balance_gamma = load_balance_gamma
         self.bias_decay = bias_decay
+        # Bias por módulo (no aprendido, feedback) + stats de observ.
+        self.register_buffer("route_bias", torch.zeros(8))
+        self.register_buffer("last_counts", torch.zeros(8, dtype=torch.long))
+        self.last_total = 0
+        self.last_aux = torch.tensor(0.0)
+        self.last_aux_live = torch.tensor(0.0)
+        self.last_z_loss = torch.tensor(0.0)
+        self.last_load_balance_loss = torch.tensor(0.0)
 
         # C1: fijo, siempre activo (sin router).
         self.up_fixed = nn.Linear(dim, h20, bias=False)
