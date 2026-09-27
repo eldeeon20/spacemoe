@@ -1,9 +1,19 @@
-"""granite.py — GraniteFF: FFN de 5 posiciones fijas.
+"""granite.py — GraniteFF: FFN de 5 posiciones fijas (SwiGLU).
 
-Diseño
-------
-La FF base es 100% = 5 bloques de 20%. Granite la reorganiza en 5
-POSICIONES virtuales::
+Denso de referencia (dim=512)::
+
+         x: 512
+         │
+         ├── up: 512 → 2048
+         └── gate: 512 → 2048
+                     ↓
+               SiLU(gate) × up
+                     ↓
+                    2048
+                     ↓
+               down: 2048 → 512
+
+Granite: cada posición es ~20% de esa expansión total::
 
     C1  = 20%  fijo (siempre activo)
     C2  = 20%  → M1 + M2
@@ -11,45 +21,39 @@ POSICIONES virtuales::
     C4  = 20%  → M5 + M6
     C5  = 20%  → M7 + M8
 
-El router hace TOP-2 SOBRE LOS 8 MÓDULOS M1–M8 (no elige una celda ni
-activa su par automáticamente). El fijo (C1) va siempre, sin router.
-Si el router elige m1 y m2 (casilla C2), ambas trabajan en paralelo
-sobre x y COMPARTEN EL MISMO LUGAR: se combinan en la posición C2::
+Cada parte (fija o módulo) es un SwiGLU completo a su ancho: up + gate
+dim->w, SiLU(gate)×up. El router hace TOP-2 SOBRE LOS 8 MÓDULOS M1–M8
+(todos menos el fijo). Por token::
 
-                 ┌─────┼─────┐
-                 ↓     ↓     ↓
-                C1     M1     M2      (20% c/u, en paralelo)
-                │     └──┬───┘
-                │        ↓
-                │   c2 = w1*M1 + w2*M2   (sigue siendo 20%)
-                ↓        ↓
-               C1        C2              (dos celdas físicas de 20%)
-                └───┬───┘
-                    ↓
-            h = cat([c1, c2])  →  40% físico
-                    ↓
-               down único → y
+    C1 20% + M_a 20% + M_b 20% = 60% activo
+
+Antes del down, la expansión física completa::
+
+    C1 + C2 + C3 + C4 + C5 = 409+409+410+410+410 = 2048
+
+Las dos ramas seleccionadas comparten su posición física mediante suma
+ponderada (M1/M2 no ocupan dos posiciones: ambas van a C2). Down
+IDÉNTICO al denso (2048→512).
 
 Ancho
 -----
-Físico (lo que vive):      C1 20% + C2 20% = 40%.
-Virtual (lo que se calcula): C1 20% + M1 20% + M2 20% = 60%.
+Físico por token: C1 (20%) + posiciones tocadas (20-40%) = 40-60%
+  (mismo slot → 40%; slots distintos → 60%).
+Virtual (calculado): C1 + 2 módulos = 60% del oculto.
+El down es completo (2048) como en el denso: el cómputo FF total
+activo/token ≈ 73% del denso (el down pesa 1/3).
 
-Es decir: la posición C2 es 20%; el cálculo dentro de C2 es 40%
-(M1 + M2). M1/M2 no ocupan dos posiciones físicas: ambos están
-asociados a la misma posición C2.
+Router: Linear(dim→8) + bias APRENDIDO (`route_bias` Parameter) +
+softmax + top-2 renormalizado (w1+w2=1). Sin ruido ni auxiliares: el
+gradiente le llega por la CE a través de los pesos.
 
-Implementación: UNA sola FF por celda (up dim->h20, silu, down),
-h20 = base // 5 (20% de la base). Sin bias (como el sketch). El router
-es un Linear dim->8 con softmax + top-2 renormalizado; entrena con
-ruido + bias-feedback + z-loss + balance (ver abajo) además del
-gradiente de la CE vía w1/w2.
+Interfaz: ``forward(x) -> Tensor`` (drop-in de capa densa: la capa hace
+``h = self.ffn(h)``). Para observar el router sin romper la interfaz se
+guarda ``last_info`` (detach: probs, índices, pesos) más ``last_counts``
+y ``balance_str()``.
 
-Interfaz drop-in para capas densas: ``forward(x) -> Tensor`` (la capa
-densa hace ``h = self.ffn(h)`` y espera tensor).
-
-Posicional: la parte de la posición 2 es siempre esa posición; cada
-módulo cae siempre en su celda, nada se reordena.
+Posicional: cada módulo cae siempre en su celda (M1/M2→C2…),
+nada se reordena.
 """
 
 import torch
@@ -58,128 +62,133 @@ import torch.nn.functional as F
 
 
 class GraniteFF(nn.Module):
-    def __init__(self, dim=512, base=2048, noise_std=0.005,
-                 z_loss_gamma=0.001, load_balance_gamma=0.0001,
-                 bias_decay=0.1):
+    """
+    Granite FF
+
+    Denso de referencia:
+        512 -> 2048 (up + gate)
+        2048 -> 512 (down)
+
+    Granite:
+        C1 = posición fija
+        C2 = M1/M2
+        C3 = M3/M4
+        C4 = M5/M6
+        C5 = M7/M8
+
+    Cada posición representa ~20% de la expansión total.
+    El router selecciona top-2 entre M1..M8.
+
+    Por token:
+        C1 20% + M_a 20% + M_b 20% = 60% activo
+
+    Antes del down:
+        5 posiciones = 2048 de ancho total.
+
+    Las dos ramas seleccionadas comparten su posición física
+    mediante suma ponderada.
+    """
+
+    def __init__(self, dim=512, base=2048):
         super().__init__()
 
-        # 20% del FF
-        h20 = base // 5  # 409
-        self.h20 = h20
-        # Entrenamiento del router (no cambian la arquitectura).
-        self.noise_std = noise_std
-        self.z_loss_gamma = z_loss_gamma
-        self.load_balance_gamma = load_balance_gamma
-        self.bias_decay = bias_decay
-        # Bias por módulo (no aprendido, feedback) + stats de observ.
-        self.register_buffer("route_bias", torch.zeros(8))
+        # 5 posiciones que suman exactamente 2048.
+        widths = [409, 409, 410, 410, 410]
+        assert sum(widths) == base
+        self.widths = widths
+
+        # C1: fija, siempre activa (SwiGLU a su ancho).
+        self.up_fixed = nn.Linear(dim, widths[0], bias=False)
+        self.gate_fixed = nn.Linear(dim, widths[0], bias=False)
+
+        # M1..M8 (SwiGLU a su ancho):
+        # M1/M2 -> C2, M3/M4 -> C3, M5/M6 -> C4, M7/M8 -> C5.
+        self.up_moe = nn.ModuleList()
+        self.gate_moe = nn.ModuleList()
+        for i in range(8):
+            slot = 1 + i // 2
+            h = widths[slot]
+            self.up_moe.append(nn.Linear(dim, h, bias=False))
+            self.gate_moe.append(nn.Linear(dim, h, bias=False))
+
+        # Router top-2 sobre los 8 (todos menos el fijo).
+        # Bias APRENDIDO (va al grupo nodecay por ser dim<2).
+        self.router = nn.Linear(dim, 8, bias=False)
+        self.route_bias = nn.Parameter(torch.zeros(8))
+
+        # MISMO down que el denso: 2048 -> dim.
+        self.down = nn.Linear(base, dim, bias=False)
+
+        # Observación del router (detach; no afecta el forward).
         self.register_buffer("last_counts", torch.zeros(8, dtype=torch.long))
         self.last_total = 0
-        self.last_aux = torch.tensor(0.0)
-        self.last_aux_live = torch.tensor(0.0)
-        self.last_z_loss = torch.tensor(0.0)
-        self.last_load_balance_loss = torch.tensor(0.0)
+        self.last_info = {}
 
-        # C1: fijo, siempre activo (sin router).
-        self.up_fixed = nn.Linear(dim, h20, bias=False)
-
-        # 8 módulos MoE, cada uno = 20%. Candidatos del router
-        # (todos menos el fijo).
-        self.up_moe = nn.ModuleList([
-            nn.Linear(dim, h20, bias=False)
-            for _ in range(8)
-        ])
-
-        # Router: selecciona 2 de los 8.
-        self.router = nn.Linear(dim, 8, bias=False)
-
-        # Un único down para el ancho físico C1 + C2 = 40%.
-        self.down = nn.Linear(h20 * 2, dim, bias=False)
+    @staticmethod
+    def swiglu(up, gate):
+        return F.silu(gate) * up
 
     def forward(self, x):
-        # --------------------------------
-        # C1: 20%, siempre activo
-        # --------------------------------
-        c1 = F.silu(self.up_fixed(x))
+        # x: [B, T, dim]
+        B, T, D = x.shape
 
-        # --------------------------------
-        # Router top-2 entre M1...M8
-        # --------------------------------
-        logits = self.router(x.float())
-        if self.training and self.noise_std > 0:
-            logits = logits + torch.randn_like(logits) * self.noise_std
-        biased = logits + self.route_bias.to(logits.dtype)
-        probs = F.softmax(biased, dim=-1)
+        # C1 FIJA (SwiGLU a 409).
+        c1 = self.swiglu(self.up_fixed(x), self.gate_fixed(x))
 
-        # Balanceo hacia uniforme (aux; no cambia el forward).
-        if self.load_balance_gamma > 0:
-            p_mean = probs.mean(dim=0)
-            tgt = torch.full_like(p_mean, 1.0 / 8.0)
-            lb_loss = self.load_balance_gamma * ((p_mean - tgt) ** 2).sum()
-        else:
-            lb_loss = torch.tensor(0.0, device=probs.device)
+        # ROUTER top-2 por TOKEN (todos menos el fijo).
+        logits = self.router(x)
+        logits = logits + self.route_bias.to(logits.dtype)
+        probs = F.softmax(logits, dim=-1)
+        weights, indices = torch.topk(probs, k=2, dim=-1)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-9)
 
-        weights, indices = torch.topk(
-            probs,
-            k=2,
-            dim=-1
-        )
+        # C2-C5: solo se calculan las posiciones cuyos módulos salieron.
+        # Cada posición tiene su ancho exacto (409/410/410/410).
+        cells = [c1] + [
+            torch.zeros(B, T, w, device=x.device, dtype=x.dtype)
+            for w in self.widths[1:]
+        ]
 
-        # Renormalizar los dos pesos (w1 + w2 = 1).
-        weights = weights / weights.sum(dim=-1, keepdim=True)
+        # TOP-2: cada módulo se procesa solo para sus tokens.
+        for k in range(2):
+            selected = indices[..., k]
+            weight = weights[..., k]
+            for expert_id in range(8):
+                mask = selected == expert_id
+                if not mask.any():
+                    continue
+                x_e = x[mask]
+                h_e = self.swiglu(
+                    self.up_moe[expert_id](x_e),
+                    self.gate_moe[expert_id](x_e),
+                )
+                # Peso del router.
+                h_e = weight[mask].unsqueeze(-1).to(h_e.dtype) * h_e
+                # Posición física del módulo:
+                # 0 -> M1/M2 -> C2, 1 -> M3/M4 -> C3,
+                # 2 -> M5/M6 -> C4, 3 -> M7/M8 -> C5.
+                slot = 1 + expert_id // 2
+                cells[slot][mask] += h_e.to(cells[slot].dtype)
 
-        # --------------------------------
-        # Dos módulos MoE, 20% cada uno.
-        # NOTA: ModuleList no acepta un tensor como índice, así que se
-        # despacha por módulo (los tokens que lo eligieron). La
-        # matemática es la misma: c2 = w1*silu(m1) + w2*silu(m2).
-        # --------------------------------
-        xf = x.reshape(-1, x.shape[-1])
-        idx = indices.reshape(-1, 2)
-        w = weights.reshape(-1, 2)
-        c2 = torch.zeros(xf.shape[0], self.h20, device=xf.device, dtype=xf.dtype)
-        for m, up in enumerate(self.up_moe):
-            for j in (0, 1):
-                sel = (idx[:, j] == m)
-                if sel.any():
-                    got = sel.nonzero(as_tuple=True)[0]
-                    c2[got] = c2[got] + w[got, j:j + 1].to(c2.dtype) * F.silu(up(xf[got]))
-        c2 = c2.reshape(x.shape[:-1] + (self.h20,))
+        # EXPANSIÓN COMPLETA: 409+409+410+410+410 = 2048.
+        h = torch.cat(cells, dim=-1)
+        assert h.shape[-1] == sum(self.widths)
 
-        # --------------------------------
-        # Combinación dentro del espacio C2.
-        # c2 = w1 * m1 + w2 * m2  →  sigue siendo 20%
-        #
-        # Físicamente:
-        # C1 = 20%
-        # C2 = 20%
-        # total = 40%
-        #
-        # Virtualmente/calculado:
-        # C1 20% + M1 20% + M2 20% = 60%
-        # --------------------------------
-        h = torch.cat([c1, c2], dim=-1)       # 40% físico
+        # DOWN idéntico al denso.
+        y = self.down(h)
 
-        out = self.down(h)
-
-        # Aux del router (z-loss sobre logits SIN bias + balanceo).
-        # Va a `last_aux_live` (con grafo: el train lo suma a la CE).
-        logsumexp = torch.logsumexp(logits, dim=-1)
-        z_loss = self.z_loss_gamma * (logsumexp ** 2).mean() if self.z_loss_gamma > 0 else torch.tensor(0.0, device=logits.device)
-        aux_loss = z_loss + lb_loss.to(z_loss.dtype)
-        self.last_aux_live = aux_loss
+        # Observación (detach) para el reporte del train.
         with torch.no_grad():
-            counts = torch.bincount(indices.flatten(), minlength=8)
-            self.last_counts = counts.clone()
-            self.last_total = xf.shape[0]
-            tgt = (self.last_total * 2) / 8
-            delta = self.bias_decay * (tgt - counts.float()) / max(self.last_total, 1)
-            self.route_bias.add_(delta.to(self.route_bias.dtype))
-            self.last_aux = aux_loss.detach()
-            self.last_z_loss = z_loss.detach()
-            self.last_load_balance_loss = lb_loss.detach()
+            self.last_counts = torch.bincount(
+                indices.flatten(), minlength=8).clone()
+            self.last_total = B * T
+            self.last_info = {
+                "router_probs": probs.detach(),
+                "top2_indices": indices.detach(),
+                "top2_weights": weights.detach(),
+            }
 
-        return out
+        return y
 
     def balance_str(self):
         """'Fija 100% | Mod: M1 ..'. Votos por módulo (top-2 por token)."""

@@ -314,14 +314,9 @@ def main():
             else:
                 logits, _ = model(x)
             loss = F.cross_entropy(logits.reshape(-1, tokenizer.vocab_size), y.reshape(-1))
-            # Aux CON grafo de cada GraniteFF (last_aux_live, no el detach).
-            aux_loss = torch.stack(
-                [l.ffn.last_aux_live for l in model.transformer.layers]).sum()
-            loss = loss + aux_loss
             (loss / grad_accum).backward()
             loss_log = float(loss.detach())
-            aux_log = float(aux_loss.detach())
-            del logits, loss, aux_loss
+            del logits, loss
             micro += 1
 
             if micro >= grad_accum:
@@ -385,36 +380,24 @@ def main():
                     tps = tok / max(now - last_rpt_time, 0.001)
                     balance_strs = []
                     granite_dist = {}
-                    total_z_loss = 0.0
-                    total_lb_loss = 0.0
                     for li, layer in enumerate(model.transformer.layers):
                         ffn = layer.ffn
-                        csum = float(ffn.last_counts.sum().item()) or 1.0
-                        pcts = (ffn.last_counts.float() / csum * 100).tolist()
-                        granite_dist[f"L{li}"] = pcts
-                        balance_strs.append(f"L{li}:{ffn.balance_str()}")
-                        # collect z-loss / load-balance from granite layer if available
                         try:
-                            if hasattr(ffn, 'last_z_loss'):
-                                total_z_loss += float(ffn.last_z_loss.item()) if isinstance(ffn.last_z_loss, torch.Tensor) else float(ffn.last_z_loss)
-                        except Exception:
-                            pass
-                        try:
-                            if hasattr(ffn, 'last_load_balance_loss'):
-                                total_lb_loss += float(ffn.last_load_balance_loss.item()) if isinstance(ffn.last_load_balance_loss, torch.Tensor) else float(ffn.last_load_balance_loss)
+                            csum = float(ffn.last_counts.sum().item()) or 1.0
+                            pcts = (ffn.last_counts.float() / csum * 100).tolist()
+                            granite_dist[f"L{li}"] = pcts
+                            balance_strs.append(f"L{li}:{ffn.balance_str()}")
                         except Exception:
                             pass
                     bal = " | ".join(balance_strs[:3])  # first 3 granite layers only
-                    print(f"e{epoch} s{step} loss {loss_log:.4f} lr {lr_curr:.6f} {tps:.0f}t/s z={total_z_loss:.6f} lb={total_lb_loss:.6f}")
-                    print(f"  Granite fwd: loss={loss_log:.4f} aux={aux_log:.6g}")
+                    print(f"e{epoch} s{step} loss {loss_log:.4f} lr {lr_curr:.6f} {tps:.0f}t/s")
+                    print(f"  Granite fwd: loss={loss_log:.4f}")
                     if bal:
                         print(f"  Granite balance: {bal}")
-                    if total_z_loss or total_lb_loss:
-                        print(f"  Granite aux: z_loss={total_z_loss:.6g} load_balance={total_lb_loss:.6g}")
                     last_rpt_time = now
                     last_rpt_step = step
                     pm.log(step, loss_log, lr_curr, tps, None,
-                           grad_norm=grad_norm.item(), moe_dist=granite_dist, z_loss=total_z_loss, load_balance_loss=total_lb_loss)
+                           grad_norm=grad_norm.item(), moe_dist=granite_dist, z_loss=0.0, load_balance_loss=0.0)
 
                 if not test_mode and step % 50 == 0:
                     t_gen = time.time()
