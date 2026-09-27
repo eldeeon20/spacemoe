@@ -145,6 +145,37 @@ def medir(c: Config, profundidad: int, width: float = 1.0, seq: int = 1) -> dict
             "macs": macs, "flops": 2 * macs}
 
 
+
+# ── Params ACTIVOS por token (MoE: solo top_k expertos) ──
+def params_activos_moe_ffn(c: Config, width: float) -> int:
+    """Lo que se calcula de verdad por token: top_k expertos al ancho pedido,
+    mas los shared a ancho COMPLETO, mas el router (que calcula las n_routes
+    enteras). Los otros 60 expertos no se tocan."""
+    d = max(8, int(c.intermediate * width))
+    por_experto = 2 * c.d_model * d              # c_fc (D,2d) + c_proj (d,D)
+    return (c.top_k * por_experto
+            + c.n_shared * params_dense_ffn(c)
+            + c.d_model * c.n_routes)
+
+
+def params_activos_capa(c: Config, idx: int, width: float) -> int:
+    base = params_mla(c) + 4 * c.d_model
+    if idx < c.n_dense_start:
+        return base + params_dense_ffn(c)
+    return base + params_activos_moe_ffn(c, width)
+
+
+def medir_activos(c: Config, profundidad: int, width: float = 1.0) -> dict:
+    esc = Escalera(n_capas=c.num_layers, minima=c.piso)
+    capas = esc.indices(profundidad)
+    # embedding y head estan atados (TiedHead): se cuenta una sola vez
+    emb = c.vocab * c.d_model
+    p_act = emb + sum(params_activos_capa(c, i, width) for i in capas)
+    p_tot = sum(params_capa(c, i) for i in capas) + emb
+    return {"capas": capas, "activos": p_act, "totales": p_tot,
+            "pct_activo": 100.0 * p_act / p_tot,
+            "flops": 2 * (sum(macs_capa(c, i, 1, width) for i in capas) + macs_head(c))}
+
 def _fmt(n: float) -> str:
     return f"{n/1e6:.2f}M" if n < 1e9 else f"{n/1e9:.2f}G"
 
