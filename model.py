@@ -284,8 +284,14 @@ class TransformerLM(nn.Module):
         la profundidad a mitad de la generacion.
         """
         x = self.embedding(input_ids)
-        x, new_caches = self.transformer.forward_with_cache(
-            x, offset, caches, width, active=active)
+        if self.use_moe:
+            x, new_caches = self.transformer.forward_with_cache(
+                x, offset, caches, width, active=active)
+        else:
+            # El Transformer denso no tiene ancho MoSE: width se ignora.
+            # (Antes width caía posicional sobre `active` y reventaba.)
+            x, new_caches = self.transformer.forward_with_cache(
+                x, offset, caches, active=active)
         return self.head(x), new_caches
 
     def forward_with_cache_partial(
