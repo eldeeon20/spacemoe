@@ -128,7 +128,7 @@ def main():
     if not test_mode:
         hf = HFManager(repo_id=repo_id, revision=revision)
         hf._get_token()
-        pusher = PeriodicPusher(hf, interval_minutes=20)
+        pusher = PeriodicPusher(hf, interval_minutes=35)
     pm = PlotManager(hf if not test_mode else None, save_dir=_DIR, plot_interval=plot_interval)
 
     # ── Precision ──────────────────────────────────────────────────────────
