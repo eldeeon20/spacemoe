@@ -93,8 +93,8 @@ def mascara(n_capas: int, profundidad: int) -> list[bool]:
 
 
 def profundidades(n_capas: int, minima: int = MIN_PROFUNDIDAD) -> list[int]:
-    """Lospeldaños validos: de minima a n_capas."""
-    return list(range(min(2, minima), n_capas + 1))
+    """Peldaños validos: de minima a n_capas."""
+    return list(range(max(2, minima), n_capas + 1))
 
 
 def elegir_profundidad(
@@ -152,6 +152,18 @@ class Escalera:
         validas = self.profundidades()
         return (rng or random).choice(validas) if len(validas) > 1 else validas[0]
 
+    def elegir_subred(self, rng: random.Random | None = None) -> int:
+        """Sortea una subred propia (2..L-1); el modelo completo va aparte.
+
+        Excluye n_capas a proposito: si el sorteo de subred incluyera el
+        modelo completo, la probabilidad real de 16L seria p_subred/L mas
+        alta que el 1 - p_subred que pide plan_step.
+        """
+        validas = list(range(self.minima, self.n_capas))
+        if not validas:
+            return self.n_capas
+        return (rng or random).choice(validas)
+
     def guardar(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -198,19 +210,21 @@ def plan_step(
 ) -> dict:
     """El plan de UN step.
 
-    p_subred = 0.8: modelo completo, loss normal de language modeling.
-    p_subred: una subred; en ese step hay que correr la completa como profesor
-    (stop-gradient) para el KL contra la subred.
+    p_subred es la probabilidad de entrenar una subred. Con p_subred=0.8
+    (el valor de train.py) el 80% de los steps entrena una subred (2..L-1);
+    el 20% restante entrena el modelo completo con loss normal. En los steps
+    de subred hay que correr la completa como profesor (stop-gradient) para
+    el KL contra la subred.
 
     Devuelve la profundidad, la mascara y el peso de la loss. La mascara es
     FIJA para todo el batch del step: la cache depende de ella.
     """
     r = rng or random
-    completa = r.random() < p_subred
+    completa = r.random() >= p_subred
     if completa:
         prof = escalera.n_capas
     else:
-        prof = escalera.elegir(r)
+        prof = escalera.elegir_subred(r)
     return {
         "profundidad": prof,
         "mascara": escalera.mascara(prof),

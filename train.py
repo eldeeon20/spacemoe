@@ -107,7 +107,7 @@ mose_w_max = 1.0
 # y asi la cache no mezcla profundidades. El ruteo de expertos sigue siendo por
 # token, normal.
 ladder_on = True            # False = siempre 16 capas (comportamiento viejo)
-ladder_p_subred = 0.2       # 0.8 de los steps van a modelo completo
+ladder_p_subred = 0.8       # 80% subred (2..15), 20% modelo completo
 ladder_lambda = 1.0         # peso del KL contra el profesor (stop-gradient)
 ladder_min_profundidad = 2  # piso; el paper arranca en 2
 
@@ -362,7 +362,7 @@ def main():
                 opt.zero_grad()
                 # Un step = una sola profundidad, fija para todo el batch.
                 if escalera_en:
-                    plan = plan_step(escalera, rng_ladder, p_subred=1.0 - ladder_p_subred)
+                    plan = plan_step(escalera, rng_ladder, p_subred=ladder_p_subred)
                     active = plan["mascara"]
                     prof = plan["profundidad"]
                     esc_step = plan["escala"]
